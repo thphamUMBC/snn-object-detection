@@ -5,7 +5,7 @@ Spiking Neural Network (SNN) for detecting cars and humans in neuromorphic camer
 ## Requirements
 
 ```bash
-pip install snntorch torch torchvision pillow matplotlib numpy
+pip install snntorch torch torchvision pillow matplotlib numpy python-dotenv
 ```
 
 ## Project Structure
@@ -14,6 +14,8 @@ pip install snntorch torch torchvision pillow matplotlib numpy
 car-detection/
 ├── code.ipynb              # Main notebook: dataset, network, training, evaluation
 ├── visualize_bbox.py       # Draw bounding boxes on images for verification
+├── .env.example             # Template for environment variables
+├── .env                     # Your local data paths (copy from .env.example)
 ├── dataset/
 │   └── ntu_threshold_20/
 │       ├── train/           # .jpg images + .txt annotations
@@ -37,6 +39,12 @@ class x_center y_center width height
 
 ## Quick Start
 
+**0. Configure data paths:**
+```bash
+cp .env.example .env
+# Edit .env to set your data paths if different from defaults
+```
+
 **1. Verify bounding boxes:**
 ```bash
 python visualize_bbox.py dataset/ntu_threshold_20/train/
@@ -45,11 +53,12 @@ Opens each image and draws the annotated bounding boxes (red=human, green=car). 
 
 **2. Run training:**
 Open `code.ipynb` in Jupyter and run all cells. The notebook:
-1. Installs `snntorch`
-2. Loads and preprocesses the dataset
-3. Defines the SNN detection network
-4. Runs a hyperparameter grid search
-5. Plots a heatmap of results
+1. Installs `snntorch` and `python-dotenv`
+2. Loads data paths from `.env` (with fallback defaults)
+3. Loads and preprocesses the dataset
+4. Defines the SNN detection network (fully-connected LIF)
+5. Runs a hyperparameter grid search
+6. Plots a heatmap of results
 
 ## Architecture
 
@@ -68,20 +77,20 @@ The cell responsible for an object is determined by where the object's center fa
 ### Network: DetectionNet
 
 ```
-Input: [B, 1, 416, 416]
+spike_data [T, B, 1, 416, 416]
   ↓
-Conv2d(1→16)   + LIF + MaxPool  → [B, 16,  208, 208]
-Conv2d(16→32)  + LIF + MaxPool  → [B, 32,  104, 104]
-Conv2d(32→64)  + LIF + MaxPool  → [B, 64,   52, 52]
-Conv2d(64→128) + LIF + MaxPool  → [B, 128,  26, 26]
-Conv2d(128→256)+ LIF + MaxPool  → [B, 256,  13, 13]
+Flatten  →  [B, 173056]    (416 × 416 = 173,056 pixels)
   ↓
-N × Conv1×1 + LIF  (configurable extra layers)
+Linear(173056 → hidden) + LIF  →  [B, hidden]
   ↓
-Conv1×1  →  [B, 7, 13, 13]   ← detection head
+[ Linear(hidden → hidden) + LIF ]  × layer_num   (1 or 2 inner layers)
+  ↓
+Linear(hidden → 1183) + LIF  →  [B, 7×13×13]
+  ↓
+Reshape  →  [B, 7, 13, 13]   ← detection output
 ```
 
-After 5 pooling layers, 416 → 13 spatial resolution. Each of the 169 cells in the 13×13 feature map corresponds to one grid cell in the image.
+The image is flattened into a 1D vector and processed through fully-connected layers with LIF spiking neurons. The output 1183 values are reshaped into 7 channels × 13×13 grid. Each of the 169 cells in the 13×13 grid corresponds to one spatial region of the image.
 
 ### LIF Neuron (Leaky Integrate-and-Fire)
 
@@ -95,16 +104,17 @@ if membrane[t] > 1.0:  fire spike, reset membrane
 
 ### Temporal Processing (the SNN difference)
 
-A standard CNN processes one static image. The SNN processes **T time steps** with different input each time:
+A standard ANN processes one static image. The SNN processes **T time steps** with different input each time:
 
 1. **Spike encoding** (`spikegen.rate`): Poisson spike trains. At each time step, each pixel independently fires a spike with probability proportional to its intensity. Bright pixel (0.9) → spikes ~90% of the time. Dark pixel (0.1) → spikes ~10% of the time.
 
 2. **Forward pass**: The network runs T times. At each time step:
    - A different set of input spikes enters
+   - The image is flattened and passed through FC layers
    - LIF membranes integrate, leak, and fire
    - Membrane state carries forward between time steps
 
-3. **Output**: Membrane potentials are summed across all T time steps for the final prediction.
+3. **Output**: Membrane potentials of the final LIF layer are summed across all T time steps, then reshaped to `[7, 13, 13]` for the final prediction.
 
 This temporal integration allows the network to accumulate evidence over time — noisy spikes at individual time steps get smoothed through the LIF dynamics.
 
@@ -132,7 +142,7 @@ For each hyperparameter configuration (16 total):
    - Sum membrane potentials over time
    - Compute detection loss
    - Backpropagate, update weights
-3. Evaluate classification accuracy on the test set
+3. Evaluate F1 score (IoU@0.5) with per-class precision/recall on the test set
 
 ### Hyperparameters
 
@@ -140,24 +150,30 @@ For each hyperparameter configuration (16 total):
 |-----------|--------|---------|
 | `beta` | 0.85, 0.95 | LIF membrane leak rate |
 | `step_num` | 25, 50 | Number of time steps for spike encoding |
-| `layer_num` | 1, 2 | Extra 1×1 conv layers after the conv stem |
-| `hidden_num` | 64, 128 | Channel count in extra conv layers |
+| `layer_num` | 1, 2 | Number of inner fully-connected + LIF layers |
+| `hidden_num` | 64, 128 | Neuron count in hidden FC layers |
 
 Grid search: 2 × 2 × 2 × 2 = **16 configurations**.
 
 ## Evaluation
 
-Classification accuracy on occupied grid cells:
+Evaluation uses proper detection metrics with IoU matching:
+
+1. **Decode predictions**: Each cell's output is converted to a detection: class, confidence, and bounding box in normalized image coordinates.
+2. **IoU matching**: Predicted boxes are matched to ground truth boxes using Intersection-over-Union (IoU) with a threshold of 0.5.
+3. **Per-class metrics**: True positives (TP), false positives (FP), and false negatives (FN) are counted per class.
+4. **Aggregate metrics**: Precision = TP/(TP+FP), Recall = TP/(TP+FN), F1 = 2×P×R/(P+R).
 
 ```
 For each test image:
     pred = sum of membrane potentials over T steps  → [7, 13, 13]
-    Find cells with ground-truth objects (confidence=1)
-    Compare predicted class vs true class
-    accuracy = correct / total objects
+    Decode predicted boxes: find cells where confidence > threshold
+    Decode ground truth boxes from target tensor
+    Match predictions to GT using IoU > 0.5 (greedy, by confidence)
+    Compute TP/FP/FN per class → Precision, Recall, F1
 ```
 
-This measures whether the network correctly identifies **what** is in each occupied cell. It does not yet measure bounding box quality (IoU) or full detection precision/recall — those require confidence thresholding and IoU matching.
+The old "class accuracy on occupied cells" metric was misleading because it only checked whether the predicted class in a pre-assigned cell matched the ground truth class — it didn't verify the box was actually at the right location. IoU-based evaluation measures whether the network can correctly **both** classify **and** localize objects.
 
 ## Edge Cases
 
