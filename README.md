@@ -77,20 +77,20 @@ The cell responsible for an object is determined by where the object's center fa
 ### Network: DetectionNet
 
 ```
-spike_data [T, B, 1, 416, 416]
+Input: [T, B, 1, 416, 416]
   ↓
-Flatten  →  [B, 173056]    (416 × 416 = 173,056 pixels)
+Conv2d(1→16,   3×3) + LIF + MaxPool(2)  →  [T, B, 16,  208, 208]
+Conv2d(16→32,  3×3) + LIF + MaxPool(2)  →  [T, B, 32,  104, 104]
+Conv2d(32→64,  3×3) + LIF + MaxPool(2)  →  [T, B, 64,   52, 52]
+Conv2d(64→128, 3×3) + LIF + MaxPool(2)  →  [T, B, 128,  26, 26]
+Conv2d(128→256,3×3) + LIF + MaxPool(2)  →  [T, B, 256,  13, 13]
   ↓
-Linear(173056 → hidden) + LIF  →  [B, hidden]
+[ Conv2d(256→hidden, 1×1) + LIF ]  × layer_num   (1 or 2 extra layers)
   ↓
-[ Linear(hidden → hidden) + LIF ]  × layer_num   (1 or 2 inner layers)
-  ↓
-Linear(hidden → 1183) + LIF  →  [B, 7×13×13]
-  ↓
-Reshape  →  [B, 7, 13, 13]   ← detection output
+Conv2d(→7, 1×1) + LIF  →  [T, B, 7, 13, 13]   ← detection head
 ```
 
-The image is flattened into a 1D vector and processed through fully-connected layers with LIF spiking neurons. The output 1183 values are reshaped into 7 channels × 13×13 grid. Each of the 169 cells in the 13×13 grid corresponds to one spatial region of the image.
+Five 3×3 conv+pool blocks downsample 416→13 spatial resolution. Each 13×13 grid cell maps directly to a 32×32 pixel region in the input image. Convolutions preserve spatial structure — a car pattern learned in one location is recognized everywhere.
 
 ### LIF Neuron (Leaky Integrate-and-Fire)
 
@@ -109,12 +109,12 @@ A standard ANN processes one static image. The SNN processes **T time steps** wi
 1. **Spike encoding** (`spikegen.rate`): Poisson spike trains. At each time step, each pixel independently fires a spike with probability proportional to its intensity. Bright pixel (0.9) → spikes ~90% of the time. Dark pixel (0.1) → spikes ~10% of the time.
 
 2. **Forward pass**: The network runs T times. At each time step:
-   - A different set of input spikes enters
-   - The image is flattened and passed through FC layers
+   - A different set of input spikes enters as `[B, 1, 416, 416]`
+   - The spike tensor flows through conv layers → LIF → pooling
    - LIF membranes integrate, leak, and fire
    - Membrane state carries forward between time steps
 
-3. **Output**: Membrane potentials of the final LIF layer are summed across all T time steps, then reshaped to `[7, 13, 13]` for the final prediction.
+3. **Output**: Membrane potentials of the head LIF layer are stacked across all T time steps: `[T, B, 7, 13, 13]`. Summed over T for the final prediction: `[B, 7, 13, 13]`.
 
 This temporal integration allows the network to accumulate evidence over time — noisy spikes at individual time steps get smoothed through the LIF dynamics.
 
@@ -150,8 +150,8 @@ For each hyperparameter configuration (16 total):
 |-----------|--------|---------|
 | `beta` | 0.85, 0.95 | LIF membrane leak rate |
 | `step_num` | 25, 50 | Number of time steps for spike encoding |
-| `layer_num` | 1, 2 | Number of inner fully-connected + LIF layers |
-| `hidden_num` | 64, 128 | Neuron count in hidden FC layers |
+| `layer_num` | 1, 2 | Number of extra 1×1 conv + LIF layers after the conv stem |
+| `hidden_num` | 64, 128 | Channel count in extra 1×1 conv layers |
 
 Grid search: 2 × 2 × 2 × 2 = **16 configurations**.
 
